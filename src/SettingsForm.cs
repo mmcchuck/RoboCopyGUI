@@ -21,7 +21,7 @@ namespace RoboCopyGUI
         // Per-profile fields
         TextBox _txtWatch, _txtDest, _txtExtra;
         NumericUpDown _numPoll, _numStable;
-        CheckBox _chkWait, _chkMove, _chkRecursive, _chkAlert, _chkSilent, _chkRunOnExisting;
+        CheckBox _chkWait, _chkMove, _chkRecursive, _chkAlert, _chkSilent, _chkRunOnExisting, _chkSync;
 
         // App-wide
         CheckBox _chkStartMin, _chkStartup;
@@ -65,7 +65,7 @@ namespace RoboCopyGUI
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(580, 600);
+            ClientSize = new Size(600, 640);
             ShowInTaskbar = true;
 
             const int leftPad = 12;
@@ -127,12 +127,13 @@ namespace RoboCopyGUI
             y += rowH + 4;
 
             // --- Behavior group ---
-            var behavior = new GroupBox { Text = "Behavior (this profile)", Left = leftPad, Top = y, Width = ClientSize.Width - leftPad - rightPad, Height = 174 };
+            var behavior = new GroupBox { Text = "Behavior (this profile)", Left = leftPad, Top = y, Width = ClientSize.Width - leftPad - rightPad, Height = 198 };
             Controls.Add(behavior);
             int gy = 22;
             _chkWait = AddCheck(behavior, "Wait for files to finish writing (lock probe + size-stable)", 12, gy); gy += 24;
             _chkRecursive = AddCheck(behavior, "Include subfolders (robocopy /E)", 12, gy); gy += 24;
             _chkMove = AddCheck(behavior, "Move instead of copy (deletes source after success)", 12, gy); gy += 24;
+            _chkSync = AddCheck(behavior, "Sync deletions (recycle dest files removed from source; 50% drop safety)", 12, gy); gy += 24;
             _chkAlert = AddCheck(behavior, "Show tray balloon when a sync completes", 12, gy); gy += 24;
             _chkSilent = AddCheck(behavior, "Silent mode (suppress all balloon notifications)", 12, gy); gy += 24;
             _chkRunOnExisting = AddCheck(behavior, "Run on existing files immediately when saved (one-time, auto-clears)", 12, gy);
@@ -199,6 +200,8 @@ namespace RoboCopyGUI
             _chkAlert.CheckedChanged += (s, e) => MarkDirty();
             _chkSilent.CheckedChanged += (s, e) => MarkDirty();
             _chkRunOnExisting.CheckedChanged += (s, e) => MarkDirty();
+            _chkSync.CheckedChanged += (s, e) => { MarkDirty(); UpdateMoveSyncGreyout(); };
+            _chkMove.CheckedChanged += (s, e) => { /* MarkDirty already wired above */ UpdateMoveSyncGreyout(); };
 
             FormClosing += (s, e) =>
             {
@@ -241,6 +244,25 @@ namespace RoboCopyGUI
         }
         void WireDirty(TextBox tb) { tb.TextChanged += (s, e) => MarkDirty(); }
         void MarkDirty() { if (!_loading) _dirty = true; }
+
+        // Move mode and Sync-deletions are mutually exclusive — mirroring after a
+        // move would wipe the destination. When Move is on, force Sync off and
+        // grey it out (and vice-versa).
+        void UpdateMoveSyncGreyout()
+        {
+            if (_chkMove == null || _chkSync == null) return;
+            if (_chkMove.Checked)
+            {
+                if (_chkSync.Checked) _chkSync.Checked = false;
+                _chkSync.Enabled = false;
+            }
+            else
+            {
+                _chkSync.Enabled = true;
+                if (_chkSync.Checked) _chkMove.Enabled = false;
+                else _chkMove.Enabled = true;
+            }
+        }
 
         void ReloadProfileList(string preferred)
         {
@@ -294,7 +316,9 @@ namespace RoboCopyGUI
                 _chkMove.Checked = _current.MoveMode;
                 _chkAlert.Checked = _current.AlertWhenDone;
                 _chkSilent.Checked = _current.RunSilent;
+                _chkSync.Checked = _current.SyncDeletions;
                 _chkRunOnExisting.Checked = false; // always start unchecked — flag is one-shot
+                UpdateMoveSyncGreyout();
                 _txtExtra.Text = _current.ExtraArgs;
                 _lblStatus.Text = "Status: " + (_current.Paused ? "Paused" : "Running");
                 _btnPause.Text = _current.Paused ? "Resume" : "Pause";
@@ -494,6 +518,7 @@ namespace RoboCopyGUI
             _current.MoveMode = _chkMove.Checked;
             _current.AlertWhenDone = _chkAlert.Checked;
             _current.RunSilent = _chkSilent.Checked;
+            _current.SyncDeletions = _chkSync.Checked;
             _current.ExtraArgs = _txtExtra.Text.Trim();
             _current.RunOnExisting = _chkRunOnExisting.Checked;
 

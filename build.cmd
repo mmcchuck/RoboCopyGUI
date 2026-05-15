@@ -32,6 +32,7 @@ set "OUT=RoboCopyGUI.exe"
   /reference:System.Core.dll ^
   /reference:System.Drawing.dll ^
   /reference:System.Windows.Forms.dll ^
+  /reference:Microsoft.VisualBasic.dll ^
   src\*.cs
 
 set ERR=%ERRORLEVEL%

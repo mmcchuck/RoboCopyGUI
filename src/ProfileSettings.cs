@@ -19,6 +19,7 @@ namespace RoboCopyGUI
         public bool RunSilent = false;
         public string ExtraArgs = "/R:1 /W:1 /NP";
         public bool Paused = false;
+        public bool SyncDeletions = false;
 
         // Transient flag: when true, the next scan treats every file that passes
         // the lock probe as ready (skipping the size-stable wait). The Watcher
@@ -46,6 +47,7 @@ namespace RoboCopyGUI
             sb.AppendLine("RunSilent=" + RunSilent);
             sb.AppendLine("ExtraArgs=" + ExtraArgs);
             sb.AppendLine("Paused=" + Paused);
+            sb.AppendLine("SyncDeletions=" + SyncDeletions);
             File.WriteAllText(path, sb.ToString());
         }
 
@@ -74,6 +76,7 @@ namespace RoboCopyGUI
                     case "RunSilent": p.RunSilent = ParseBool(v, false); break;
                     case "ExtraArgs": p.ExtraArgs = v; break;
                     case "Paused": p.Paused = ParseBool(v, false); break;
+                    case "SyncDeletions": p.SyncDeletions = ParseBool(v, false); break;
                 }
             }
             return p;

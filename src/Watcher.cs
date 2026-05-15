@@ -18,6 +18,8 @@ namespace RoboCopyGUI
         bool _running;
         int _scanInFlight; // 0 = idle, 1 = a scan is already running on the threadpool
         readonly SynchronizationContext _uiContext;
+        int _lastSourceFileCount = -1; // -1 = no prior scan recorded; used to delay large purges by one cycle
+        const double PurgeShrinkThreshold = 0.5; // refuse to purge if current source < 50% of last seen
 
         public event Action<string, int, bool> RunCompleted; // profile, exitCode, success
         public event Action<string, string> StatusChanged;   // profile, status
@@ -188,6 +190,18 @@ namespace RoboCopyGUI
             }
 
             RunRobocopy(s, src, dst, busy);
+
+            // Mirror-style deletion is mutually exclusive with Move mode (which
+            // already empties the source — mirroring after a move would wipe
+            // the destination). UI prevents the combination; this is a belt.
+            if (s.SyncDeletions && !s.MoveMode)
+                SyncDestinationDeletions(s, src, dst, busy, files.Length);
+
+            // Record the current source file count for the next cycle's safety
+            // check. Done even if we didn't purge — a one-cycle "block then
+            // permit" gives the user 60s to notice an unexpected drop.
+            _lastSourceFileCount = files.Length;
+
             PruneState(s, src);
         }
 
@@ -358,6 +372,87 @@ namespace RoboCopyGUI
                     (mismatched > 0 ? ", " + mismatched + " size-mismatch (kept)" : ""));
             }
             return deleted;
+        }
+
+        void SyncDestinationDeletions(ProfileSettings s, string src, string dst, List<string> excludeAbsolute, int sourceFileCount)
+        {
+            // Hard safety: if the source is empty, refuse. This is the canonical
+            // "drive unmounted" symptom and the failure mode that would wipe a
+            // destination on the next poll.
+            if (sourceFileCount == 0)
+            {
+                Logger.Log(s.Name, "sync-deletions: source has 0 files; refusing to purge destination (likely misconfig or unmounted share)");
+                return;
+            }
+
+            // Soft safety: if the source count just dropped >50% vs last seen,
+            // skip this cycle. The caller still updates _lastSourceFileCount, so
+            // if the drop is sustained the next cycle's ratio becomes ~1.0 and
+            // the purge proceeds. Net effect: a one-cycle delay (~PollSeconds)
+            // between "user nukes a chunk of source" and "destination follows".
+            if (_lastSourceFileCount > 0)
+            {
+                double ratio = (double)sourceFileCount / _lastSourceFileCount;
+                if (ratio < PurgeShrinkThreshold)
+                {
+                    Logger.Log(s.Name,
+                        "sync-deletions: source dropped from " + _lastSourceFileCount + " to " + sourceFileCount +
+                        " files (more than 50%); delaying purge by one cycle as a safety check");
+                    return;
+                }
+            }
+
+            var searchOpt = s.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            string[] srcFiles;
+            string[] dstFiles;
+            try { srcFiles = Directory.GetFiles(src, "*", searchOpt); }
+            catch (Exception ex) { Logger.Log(s.Name, "sync-deletions: src enumerate failed: " + ex.Message); return; }
+            try { dstFiles = Directory.GetFiles(dst, "*", searchOpt); }
+            catch (Exception ex) { Logger.Log(s.Name, "sync-deletions: dst enumerate failed: " + ex.Message); return; }
+
+            // Build the set of expected destination paths from current source
+            // contents (busy files included — they belong at the destination
+            // even though robocopy excluded them this cycle).
+            var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var sf in srcFiles)
+            {
+                string rel = MakeRelative(src, sf);
+                if (rel == null) continue;
+                expected.Add(Path.Combine(dst, rel));
+            }
+
+            int recycled = 0;
+            int failed = 0;
+            foreach (var df in dstFiles)
+            {
+                if (expected.Contains(df)) continue;
+                try
+                {
+                    File.SetAttributes(df, FileAttributes.Normal);
+                    Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
+                        df,
+                        Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                        Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin,
+                        Microsoft.VisualBasic.FileIO.UICancelOption.DoNothing);
+                    recycled++;
+                    Logger.Log(s.Name, "sync-deletions: recycled " + df);
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    Logger.Log(s.Name, "sync-deletions: recycle failed (" + df + "): " + ex.Message);
+                }
+            }
+
+            if (s.Recursive && recycled > 0)
+                PruneEmptySubdirs(s, dst);
+
+            if (recycled > 0 || failed > 0)
+            {
+                Logger.Log(s.Name,
+                    "sync-deletions: recycled " + recycled + " orphan(s) from destination" +
+                    (failed > 0 ? ", " + failed + " failure(s)" : ""));
+            }
         }
 
         static string MakeRelative(string baseDir, string fullPath)
