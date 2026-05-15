@@ -1,0 +1,15 @@
+# Build outputs
+RoboCopyGUI.exe
+*.pdb
+*.obj
+bin/
+obj/
+
+# Icon preview renders (regenerate with tools/preview-icon.ps1)
+icon-preview-*.png
+
+# Legacy / backup files
+*.bak
+
+# Local Claude state
+.claude/
