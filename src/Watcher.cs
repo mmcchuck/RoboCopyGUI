@@ -4,17 +4,20 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace RoboCopyGUI
 {
     public class Watcher
     {
-        readonly Timer _timer = new Timer();
+        readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
         ProfileSettings _settings;
         readonly Dictionary<string, FileState> _state =
             new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
         bool _running;
+        int _scanInFlight; // 0 = idle, 1 = a scan is already running on the threadpool
+        readonly SynchronizationContext _uiContext;
 
         public event Action<string, int, bool> RunCompleted; // profile, exitCode, success
         public event Action<string, string> StatusChanged;   // profile, status
@@ -30,7 +33,8 @@ namespace RoboCopyGUI
         public Watcher(ProfileSettings s)
         {
             _settings = s;
-            _timer.Tick += (a, b) => SafeScan();
+            _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+            _timer.Tick += (a, b) => TriggerScan();
             ApplyInterval();
         }
 
@@ -69,13 +73,40 @@ namespace RoboCopyGUI
 
         public void RunOnce()
         {
-            SafeScan();
+            TriggerScan();
+        }
+
+        // Kick a scan onto the threadpool. Returns immediately. If a previous
+        // scan is still running (slow network share, big folder), skip this
+        // tick rather than queue up overlapping work.
+        void TriggerScan()
+        {
+            if (Interlocked.CompareExchange(ref _scanInFlight, 1, 0) != 0)
+            {
+                Logger.Log(_settings.Name, "tick skipped: previous scan still in flight");
+                return;
+            }
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { SafeScan(); }
+                finally { Interlocked.Exchange(ref _scanInFlight, 0); }
+            });
         }
 
         void RaiseStatus(string s)
         {
             var h = StatusChanged;
-            if (h != null) h(_settings.Name, s);
+            if (h == null) return;
+            string name = _settings.Name;
+            _uiContext.Post(_unused => h(name, s), null);
+        }
+
+        void RaiseRunCompleted(int code, bool success)
+        {
+            var h = RunCompleted;
+            if (h == null) return;
+            string name = _settings.Name;
+            _uiContext.Post(_unused => h(name, code, success), null);
         }
 
         void SafeScan()
@@ -86,25 +117,29 @@ namespace RoboCopyGUI
 
         void Scan()
         {
-            string src = _settings.WatchFolder;
-            string dst = _settings.DestinationFolder;
+            // Snapshot the settings once so a concurrent UpdateSettings call
+            // (UI thread) can't tear our view of the profile mid-scan.
+            var s = _settings;
+
+            string src = s.WatchFolder;
+            string dst = s.DestinationFolder;
             if (string.IsNullOrEmpty(src) || string.IsNullOrEmpty(dst)) return;
 
             if (!Directory.Exists(src))
             {
-                Logger.Log(_settings.Name, "watch folder missing: " + src);
+                Logger.Log(s.Name, "watch folder missing: " + src);
                 return;
             }
             if (!Directory.Exists(dst))
             {
                 try { Directory.CreateDirectory(dst); }
-                catch (Exception ex) { Logger.Log(_settings.Name, "create dest failed: " + ex.Message); return; }
+                catch (Exception ex) { Logger.Log(s.Name, "create dest failed: " + ex.Message); return; }
             }
 
-            var searchOpt = _settings.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            var searchOpt = s.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
             string[] files;
             try { files = Directory.GetFiles(src, "*", searchOpt); }
-            catch (Exception ex) { Logger.Log(_settings.Name, "enumerate failed: " + ex.Message); return; }
+            catch (Exception ex) { Logger.Log(s.Name, "enumerate failed: " + ex.Message); return; }
 
             if (files.Length == 0)
             {
@@ -112,26 +147,51 @@ namespace RoboCopyGUI
                 return;
             }
 
+            // Consume the one-shot RunOnExisting flag at the top of the scan so it
+            // can never linger past this cycle (even if we early-return below).
+            bool runOnExisting = s.RunOnExisting;
+            if (runOnExisting)
+            {
+                s.RunOnExisting = false;
+                Logger.Log(s.Name, "run-on-existing: handing " + files.Length + " file(s) to robocopy (skipping per-file lock probe)");
+            }
+
+            // When run-on-existing is set, the user is asserting "these files are
+            // ready" — skip the per-file lock probe entirely. Robocopy itself
+            // handles in-use files via /R retries. This is the difference
+            // between a 1-second scan and a multi-minute UI freeze when the
+            // watch folder is a slow network share with thousands of files.
             var busy = new List<string>();
-            if (_settings.WaitForFinish)
+            if (s.WaitForFinish && !runOnExisting)
             {
                 foreach (var f in files)
                 {
-                    if (IsBusy(f)) busy.Add(f);
+                    if (IsBusy(s, f)) busy.Add(f);
                 }
             }
 
-            if (_settings.WaitForFinish && busy.Count == files.Length)
+            if (s.WaitForFinish && !runOnExisting && busy.Count == files.Length)
             {
-                Logger.Log(_settings.Name, "all " + files.Length + " file(s) busy; skipping cycle");
+                Logger.Log(s.Name, "all " + files.Length + " file(s) busy; skipping cycle");
                 return;
             }
 
-            RunRobocopy(src, dst, busy);
-            PruneState(src);
+            // If we skipped probing, seed the size-stable state so the next
+            // regular cycle has a baseline for each file.
+            if (runOnExisting)
+            {
+                foreach (var f in files)
+                {
+                    try { _state[f] = new FileState { Size = new FileInfo(f).Length, LastChangeUtc = DateTime.UtcNow }; }
+                    catch { }
+                }
+            }
+
+            RunRobocopy(s, src, dst, busy);
+            PruneState(s, src);
         }
 
-        bool IsBusy(string path)
+        bool IsBusy(ProfileSettings s, string path)
         {
             try
             {
@@ -166,7 +226,7 @@ namespace RoboCopyGUI
             }
 
             double stableFor = (DateTime.UtcNow - st.LastChangeUtc).TotalSeconds;
-            return stableFor < _settings.StableSeconds;
+            return stableFor < s.StableSeconds;
         }
 
         void Touch(string path, long size)
@@ -174,11 +234,11 @@ namespace RoboCopyGUI
             _state[path] = new FileState { Size = size, LastChangeUtc = DateTime.UtcNow };
         }
 
-        void PruneState(string src)
+        void PruneState(ProfileSettings s, string src)
         {
             try
             {
-                var searchOpt = _settings.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+                var searchOpt = s.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
                 var existing = new HashSet<string>(Directory.GetFiles(src, "*", searchOpt), StringComparer.OrdinalIgnoreCase);
                 var stale = _state.Keys.Where(k => !existing.Contains(k)).ToList();
                 foreach (var k in stale) _state.Remove(k);
@@ -186,19 +246,19 @@ namespace RoboCopyGUI
             catch { }
         }
 
-        void RunRobocopy(string src, string dst, List<string> exclude)
+        void RunRobocopy(ProfileSettings s, string src, string dst, List<string> exclude)
         {
             var args = new StringBuilder();
             args.Append("\"").Append(src.TrimEnd('\\')).Append("\" ");
             args.Append("\"").Append(dst.TrimEnd('\\')).Append("\" ");
-            if (_settings.Recursive) args.Append("/E ");
+            if (s.Recursive) args.Append("/E ");
             // Note: we deliberately do NOT pass /MOV. Robocopy's /MOV only deletes
             // source files it actually copied, which leaves "Same" files behind
             // (e.g. when a previous Copy-mode run already populated the destination).
             // We handle source deletion ourselves after a successful run — see
             // DeleteMovedSourceFiles below.
-            if (!string.IsNullOrWhiteSpace(_settings.ExtraArgs))
-                args.Append(_settings.ExtraArgs.Trim()).Append(' ');
+            if (!string.IsNullOrWhiteSpace(s.ExtraArgs))
+                args.Append(s.ExtraArgs.Trim()).Append(' ');
             if (exclude.Count > 0)
             {
                 args.Append("/XF ");
@@ -207,7 +267,7 @@ namespace RoboCopyGUI
             }
 
             string cmdLine = args.ToString().Trim();
-            Logger.Log(_settings.Name, "robocopy " + cmdLine);
+            Logger.Log(s.Name, "robocopy " + cmdLine);
 
             var psi = new ProcessStartInfo("robocopy.exe", cmdLine)
             {
@@ -223,8 +283,8 @@ namespace RoboCopyGUI
             {
                 using (var p = Process.Start(psi))
                 {
-                    p.OutputDataReceived += (s, e) => { if (e.Data != null) output.AppendLine(e.Data); };
-                    p.ErrorDataReceived += (s, e) => { if (e.Data != null) output.AppendLine("ERR: " + e.Data); };
+                    p.OutputDataReceived += (sndr, e) => { if (e.Data != null) output.AppendLine(e.Data); };
+                    p.ErrorDataReceived += (sndr, e) => { if (e.Data != null) output.AppendLine("ERR: " + e.Data); };
                     p.BeginOutputReadLine();
                     p.BeginErrorReadLine();
                     p.WaitForExit();
@@ -233,9 +293,8 @@ namespace RoboCopyGUI
             }
             catch (Exception ex)
             {
-                Logger.Log(_settings.Name, "robocopy launch failed: " + ex.Message);
-                var h = RunCompleted;
-                if (h != null) h(_settings.Name, -1, false);
+                Logger.Log(s.Name, "robocopy launch failed: " + ex.Message);
+                RaiseRunCompleted(-1, false);
                 return;
             }
 
@@ -243,24 +302,23 @@ namespace RoboCopyGUI
             // bits 2-3 = mismatches, bits 4-5 = errors. >=8 means at least one failure.
             bool success = code < 8;
             bool filesCopied = (code & 1) != 0;
-            Logger.Log(_settings.Name, "robocopy exit=" + code + (filesCopied ? " (files copied)" : " (no copies)"));
-            if (output.Length > 0) Logger.Log(_settings.Name, "robocopy output:\r\n" + output);
+            Logger.Log(s.Name, "robocopy exit=" + code + (filesCopied ? " (files copied)" : " (no copies)"));
+            if (output.Length > 0) Logger.Log(s.Name, "robocopy output:\r\n" + output);
 
             int moved = 0;
-            if (_settings.MoveMode && success)
-                moved = DeleteMovedSourceFiles(src, dst, exclude);
+            if (s.MoveMode && success)
+                moved = DeleteMovedSourceFiles(s, src, dst, exclude);
 
-            var handler = RunCompleted;
-            if (handler != null && (filesCopied || moved > 0)) handler(_settings.Name, code, success);
+            if (filesCopied || moved > 0) RaiseRunCompleted(code, success);
         }
 
-        int DeleteMovedSourceFiles(string src, string dst, List<string> excludeAbsolute)
+        int DeleteMovedSourceFiles(ProfileSettings s, string src, string dst, List<string> excludeAbsolute)
         {
             var excludeSet = new HashSet<string>(excludeAbsolute, StringComparer.OrdinalIgnoreCase);
-            var searchOpt = _settings.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            var searchOpt = s.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
             string[] files;
             try { files = Directory.GetFiles(src, "*", searchOpt); }
-            catch (Exception ex) { Logger.Log(_settings.Name, "move cleanup: enumerate failed: " + ex.Message); return 0; }
+            catch (Exception ex) { Logger.Log(s.Name, "move cleanup: enumerate failed: " + ex.Message); return 0; }
 
             int deleted = 0;
             int mismatched = 0;
@@ -286,16 +344,16 @@ namespace RoboCopyGUI
                 }
                 catch (Exception ex)
                 {
-                    Logger.Log(_settings.Name, "move cleanup: delete failed (" + f + "): " + ex.Message);
+                    Logger.Log(s.Name, "move cleanup: delete failed (" + f + "): " + ex.Message);
                 }
             }
 
-            if (_settings.Recursive && deleted > 0)
-                PruneEmptySubdirs(src);
+            if (s.Recursive && deleted > 0)
+                PruneEmptySubdirs(s, src);
 
             if (deleted > 0 || mismatched > 0)
             {
-                Logger.Log(_settings.Name,
+                Logger.Log(s.Name,
                     "move cleanup: deleted " + deleted + " source file(s)" +
                     (mismatched > 0 ? ", " + mismatched + " size-mismatch (kept)" : ""));
             }
@@ -317,7 +375,7 @@ namespace RoboCopyGUI
             return null;
         }
 
-        void PruneEmptySubdirs(string root)
+        void PruneEmptySubdirs(ProfileSettings s, string root)
         {
             try
             {
@@ -333,7 +391,7 @@ namespace RoboCopyGUI
                     catch { }
                 }
             }
-            catch (Exception ex) { Logger.Log(_settings.Name, "prune empty subdirs failed: " + ex.Message); }
+            catch (Exception ex) { Logger.Log(s.Name, "prune empty subdirs failed: " + ex.Message); }
         }
     }
 }

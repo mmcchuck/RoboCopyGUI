@@ -191,9 +191,11 @@ namespace RoboCopyGUI
                     {
                         // New profile created via form's New flow path (already saved to disk before this fires).
                         SyncWatchersFromDisk();
+                        _watchers.TryGetValue(p.Name, out w);
                     }
                     RebuildMenu();
                     UpdateIconText();
+                    if (p.RunOnExisting && w != null) w.RunOnce();
                 };
                 _form.ProfilesListChanged += () =>
                 {

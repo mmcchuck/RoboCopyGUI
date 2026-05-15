@@ -20,6 +20,12 @@ namespace RoboCopyGUI
         public string ExtraArgs = "/R:1 /W:1 /NP";
         public bool Paused = false;
 
+        // Transient flag: when true, the next scan treats every file that passes
+        // the lock probe as ready (skipping the size-stable wait). The Watcher
+        // clears the flag after consuming it; we deliberately do NOT serialize
+        // it to disk so it never auto-fires on a future launch.
+        public bool RunOnExisting = false;
+
         public ProfileSettings Clone()
         {
             return (ProfileSettings)MemberwiseClone();

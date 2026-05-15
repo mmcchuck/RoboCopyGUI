@@ -21,7 +21,7 @@ namespace RoboCopyGUI
         // Per-profile fields
         TextBox _txtWatch, _txtDest, _txtExtra;
         NumericUpDown _numPoll, _numStable;
-        CheckBox _chkWait, _chkMove, _chkRecursive, _chkAlert, _chkSilent;
+        CheckBox _chkWait, _chkMove, _chkRecursive, _chkAlert, _chkSilent, _chkRunOnExisting;
 
         // App-wide
         CheckBox _chkStartMin, _chkStartup;
@@ -127,14 +127,15 @@ namespace RoboCopyGUI
             y += rowH + 4;
 
             // --- Behavior group ---
-            var behavior = new GroupBox { Text = "Behavior (this profile)", Left = leftPad, Top = y, Width = ClientSize.Width - leftPad - rightPad, Height = 150 };
+            var behavior = new GroupBox { Text = "Behavior (this profile)", Left = leftPad, Top = y, Width = ClientSize.Width - leftPad - rightPad, Height = 174 };
             Controls.Add(behavior);
             int gy = 22;
             _chkWait = AddCheck(behavior, "Wait for files to finish writing (lock probe + size-stable)", 12, gy); gy += 24;
             _chkRecursive = AddCheck(behavior, "Include subfolders (robocopy /E)", 12, gy); gy += 24;
-            _chkMove = AddCheck(behavior, "Move instead of copy (robocopy /MOV — deletes source after success)", 12, gy); gy += 24;
+            _chkMove = AddCheck(behavior, "Move instead of copy (deletes source after success)", 12, gy); gy += 24;
             _chkAlert = AddCheck(behavior, "Show tray balloon when a sync completes", 12, gy); gy += 24;
-            _chkSilent = AddCheck(behavior, "Silent mode (suppress all balloon notifications)", 12, gy);
+            _chkSilent = AddCheck(behavior, "Silent mode (suppress all balloon notifications)", 12, gy); gy += 24;
+            _chkRunOnExisting = AddCheck(behavior, "Run on existing files immediately when saved (one-time, auto-clears)", 12, gy);
             y += behavior.Height + 8;
 
             // --- Startup group (app-wide) ---
@@ -197,6 +198,7 @@ namespace RoboCopyGUI
             _chkMove.CheckedChanged += (s, e) => MarkDirty();
             _chkAlert.CheckedChanged += (s, e) => MarkDirty();
             _chkSilent.CheckedChanged += (s, e) => MarkDirty();
+            _chkRunOnExisting.CheckedChanged += (s, e) => MarkDirty();
 
             FormClosing += (s, e) =>
             {
@@ -292,6 +294,7 @@ namespace RoboCopyGUI
                 _chkMove.Checked = _current.MoveMode;
                 _chkAlert.Checked = _current.AlertWhenDone;
                 _chkSilent.Checked = _current.RunSilent;
+                _chkRunOnExisting.Checked = false; // always start unchecked — flag is one-shot
                 _txtExtra.Text = _current.ExtraArgs;
                 _lblStatus.Text = "Status: " + (_current.Paused ? "Paused" : "Running");
                 _btnPause.Text = _current.Paused ? "Resume" : "Pause";
@@ -492,12 +495,22 @@ namespace RoboCopyGUI
             _current.AlertWhenDone = _chkAlert.Checked;
             _current.RunSilent = _chkSilent.Checked;
             _current.ExtraArgs = _txtExtra.Text.Trim();
+            _current.RunOnExisting = _chkRunOnExisting.Checked;
 
-            try { ProfileStore.Save(_current); }
+            try { ProfileStore.Save(_current); } // does not persist RunOnExisting
             catch (Exception ex) { MessageBox.Show(this, "Could not save profile: " + ex.Message, "RoboCopyGUI"); return false; }
 
             var hProf = ProfileSaved;
             if (hProf != null) hProf(_current.Clone());
+
+            // Auto-clear the one-shot flag both in the model and on the UI.
+            if (_current.RunOnExisting)
+            {
+                _current.RunOnExisting = false;
+                _loading = true;
+                try { _chkRunOnExisting.Checked = false; }
+                finally { _loading = false; }
+            }
 
             _dirty = false;
             return true;
